@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Stroop Test - Time Pressure Study</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body { margin: 0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  #initial-loader { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: #f8fafc; color: #64748b; font-size: 14px; }
+</style>
+</head>
+<body>
+<div id="root"><div id="initial-loader">Loading test…</div></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useCallback } = React;
+
+/* ===========================================================
+   ===  EDIT THIS LINE BEFORE DEPLOYING  =====================
+   Paste the Google Apps Script Web App URL between the quotes.
+   =========================================================== */
+const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzlXZaOBOFZ8k5nC2awnlucVPKnFrtNR0ADItqvGO-xeIPF7shLWvEEkGEZQuowdr9h/exec";
+
+// ---------- Experiment configuration ----------
+const COLORS = [
+  { name: 'RED',    hex: '#dc2626', key: 'r' },
+  { name: 'GREEN',  hex: '#16a34a', key: 'g' },
+  { name: 'BLUE',   hex: '#2563eb', key: 'b' },
+  { name: 'YELLOW', hex: '#ca8a04', key: 'y' },
+];
+const PRACTICE_TRIALS   = 8;
+const BLOCK_DURATION_MS = 60_000;   // 60 s hard cutoff for BOTH conditions
+const FIXATION_MS       = 250;
+const ITI_MS            = 150;
+
+// ---------- Helpers ----------
+function makeTrial() {
+  const wordIdx = Math.floor(Math.random() * COLORS.length);
+  let inkIdx;
+  if (Math.random() < 0.5) inkIdx = wordIdx;
+  else { do { inkIdx = Math.floor(Math.random() * COLORS.length); } while (inkIdx === wordIdx); }
+  return {
+    word: COLORS[wordIdx].name,
+    inkColor: COLORS[inkIdx].name,
+    inkHex: COLORS[inkIdx].hex,
+    congruent: wordIdx === inkIdx,
+    correctKey: COLORS[inkIdx].key,
+  };
+}
+
+function generateParticipantId() {
+  const d = new Date();
+  const ymd = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`;
+  const hm  = `${String(d.getHours()).padStart(2,'0')}${String(d.getMinutes()).padStart(2,'0')}`;
+  const rand = Math.random().toString(36).substring(2, 6).toUpperCase();
+  return `P${ymd}-${hm}-${rand}`;
+}
+
+function toCSV(rows) {
+  if (!rows.length) return '';
+  const headers = Object.keys(rows[0]);
+  const escape = (v) => { const s = String(v ?? ''); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+  return [headers.join(','), ...rows.map(r => headers.map(h => escape(r[h])).join(','))].join('\n');
+}
+function downloadCSV(filename, csv) {
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function summarize(rows, label) {
+  const main = rows.filter(r => r.block === 'main' && r.condition === label);
+  if (!main.length) return null;
+  const responded = main.filter(r => r.response !== '');
+  const correct   = responded.filter(r => r.correct);
+  const wrong     = responded.filter(r => !r.correct);
+
+  const totalQuestions = main.length;            // includes the cut-off mid-trial if any
+  const correctAnswers = correct.length;
+  const wrongAnswers   = wrong.length;
+  const accuracyRate = totalQuestions ? (correctAnswers / totalQuestions) * 100 : 0;
+  const errorRate    = totalQuestions ? (wrongAnswers   / totalQuestions) * 100 : 0;
+  const meanRT = correct.length ? correct.reduce((a,b)=>a+b.rt_ms,0) / correct.length : 0;
+
+  const durationSec = BLOCK_DURATION_MS / 1000;
+  const questionRate       = (totalQuestions / durationSec) * 60;
+  const taskCompletionRate = totalQuestions ? (responded.length / totalQuestions) * 100 : 0;
+  const performanceIndex   = (correctAnswers / durationSec) * (accuracyRate / 100) * 100;
+
+  const cCon = correct.filter(r => r.congruent);
+  const cInc = correct.filter(r => !r.congruent);
+  const rtCon = cCon.length ? cCon.reduce((a,b)=>a+b.rt_ms,0)/cCon.length : 0;
+  const rtInc = cInc.length ? cInc.reduce((a,b)=>a+b.rt_ms,0)/cInc.length : 0;
+
+  return {
+    condition: label, totalQuestions, correctAnswers, wrongAnswers,
+    accuracyRate, errorRate, meanRT,
+    questionRate, taskCompletionRate, performanceIndex,
+    stroopEffect: rtInc - rtCon,
+  };
+}
+
+// ---------- Main component ----------
+function StroopApp() {
+  const [screen, setScreen] = useState('setup');
+  const [participant, setParticipant] = useState({ id: '', age: '', gender: '' });
+  const [conditionOrder, setConditionOrder] = useState('timed_first');
+  const [blockIndex, setBlockIndex] = useState(0);
+
+  const [practiceIdx, setPracticeIdx] = useState(0);
+  const [practiceTrials, setPracticeTrials] = useState([]);
+  const [currentTrial, setCurrentTrial] = useState(null);
+  const [phase, setPhase] = useState('idle');
+  const [data, setData] = useState([]);
+  const [practiceFeedback, setPracticeFeedback] = useState(null);
+  const [blockElapsedMs, setBlockElapsedMs] = useState(0);
+
+  const [submitStatus, setSubmitStatus] = useState('idle');
+
+  const stimOnsetRef     = useRef(0);
+  const blockStartRef    = useRef(0);
+  const fixationTimer    = useRef(null);
+  const itiTimer         = useRef(null);
+  const blockEndTimer    = useRef(null);
+  const tickerRef        = useRef(null);
+  const blockActiveRef   = useRef(false);
+  const phaseRef         = useRef('idle');
+  const currentTrialRef  = useRef(null);
+  const trialCounterRef  = useRef(0);
+
+  useEffect(() => { phaseRef.current = phase; }, [phase]);
+  useEffect(() => { currentTrialRef.current = currentTrial; }, [currentTrial]);
+
+  const currentCondition = (() => {
+    if (screen === 'practice') return 'practice';
+    const order = conditionOrder === 'timed_first' ? ['timed','untimed'] : ['untimed','timed'];
+    return order[blockIndex];
+  })();
+  const isTimedVisible = currentCondition === 'timed';
+
+  const clearAllTimers = () => {
+    clearTimeout(fixationTimer.current);
+    clearTimeout(itiTimer.current);
+    clearTimeout(blockEndTimer.current);
+    clearInterval(tickerRef.current);
+  };
+
+  // Setup: auto-assign ID and randomize order when continuing
+  const handleStartSession = () => {
+    const newId = generateParticipantId();
+    const newOrder = Math.random() < 0.5 ? 'timed_first' : 'untimed_first';
+    setParticipant({ ...participant, id: newId });
+    setConditionOrder(newOrder);
+    setScreen('instructions');
+  };
+
+  const startPractice = () => {
+    clearAllTimers();
+    const trials = Array.from({ length: PRACTICE_TRIALS }, makeTrial);
+    setPracticeTrials(trials); setPracticeIdx(0); setCurrentTrial(trials[0]);
+    setPracticeFeedback(null); setScreen('practice'); setPhase('fixation');
+  };
+
+  const startMainBlock = () => {
+    clearAllTimers();
+    setBlockElapsedMs(0);
+    trialCounterRef.current = 0;
+    setCurrentTrial(makeTrial());
+    setPracticeFeedback(null);
+    setScreen('main'); setPhase('fixation');
+    blockActiveRef.current = true;
+    blockStartRef.current = performance.now();
+
+    // HARD 60-second cutoff for BOTH conditions (visible or hidden timer)
+    blockEndTimer.current = setTimeout(() => endMainBlock(), BLOCK_DURATION_MS);
+
+    // Ticker for elapsed time (used by visible timer + as a record)
+    tickerRef.current = setInterval(() => {
+      setBlockElapsedMs(Math.min(performance.now() - blockStartRef.current, BLOCK_DURATION_MS));
+    }, 100);
+  };
+
+  const endMainBlock = () => {
+    blockActiveRef.current = false;
+    clearAllTimers();
+
+    // If we were showing a stimulus that never got a response, log it as incomplete
+    if (phaseRef.current === 'stimulus' && currentTrialRef.current) {
+      const trial = currentTrialRef.current;
+      const incompleteRow = {
+        participant_id: participant.id,
+        age: participant.age, gender: participant.gender,
+        condition_order: conditionOrder,
+        condition: currentCondition,
+        block: 'main',
+        trial_num: trialCounterRef.current,
+        word: trial.word, ink_color: trial.inkColor,
+        congruent: trial.congruent, correct_key: trial.correctKey,
+        response: '', correct: false,
+        rt_ms: '', block_elapsed_ms: BLOCK_DURATION_MS,
+        timestamp_iso: new Date().toISOString(),
+      };
+      setData(prev => [...prev, incompleteRow]);
+    }
+
+    setPhase('idle');
+    if (blockIndex === 0) { setBlockIndex(1); setScreen('break'); }
+    else { setScreen('finished'); }
+  };
+
+  // Phase advancement
+  useEffect(() => {
+    if (screen !== 'practice' && screen !== 'main') return;
+
+    if (phase === 'fixation') {
+      fixationTimer.current = setTimeout(() => {
+        if (screen === 'main' && !blockActiveRef.current) return;
+        stimOnsetRef.current = performance.now();
+        if (screen === 'main') trialCounterRef.current++;
+        setPhase('stimulus');
+      }, FIXATION_MS);
+    } else if (phase === 'iti') {
+      itiTimer.current = setTimeout(() => {
+        if (screen === 'practice') {
+          const next = practiceIdx + 1;
+          if (next >= practiceTrials.length) { setScreen('break'); setPhase('idle'); return; }
+          setPracticeIdx(next); setCurrentTrial(practiceTrials[next]);
+          setPracticeFeedback(null); setPhase('fixation');
+        } else {
+          if (!blockActiveRef.current) return;
+          setCurrentTrial(makeTrial());
+          setPhase('fixation');
+        }
+      }, ITI_MS);
+    }
+    return () => { clearTimeout(fixationTimer.current); clearTimeout(itiTimer.current); };
+  }, [phase, screen, practiceIdx]);
+
+  // Response handling
+  const recordResponse = useCallback((key) => {
+    if (phase !== 'stimulus' || !currentTrial) return;
+    const rt = performance.now() - stimOnsetRef.current;
+    const correct = key === currentTrial.correctKey;
+    const trialNum = screen === 'practice' ? practiceIdx + 1 : trialCounterRef.current;
+    const row = {
+      participant_id: participant.id,
+      age: participant.age, gender: participant.gender,
+      condition_order: conditionOrder,
+      condition: screen === 'practice' ? 'practice' : currentCondition,
+      block: screen === 'practice' ? 'practice' : 'main',
+      trial_num: trialNum,
+      word: currentTrial.word, ink_color: currentTrial.inkColor,
+      congruent: currentTrial.congruent, correct_key: currentTrial.correctKey,
+      response: key, correct, rt_ms: Math.round(rt),
+      block_elapsed_ms: screen === 'main' ? Math.round(performance.now() - blockStartRef.current) : '',
+      timestamp_iso: new Date().toISOString(),
+    };
+    setData(prev => [...prev, row]);
+    if (screen === 'practice') setPracticeFeedback(correct ? 'correct' : 'incorrect');
+    setPhase('iti');
+  }, [phase, currentTrial, screen, practiceIdx, participant, conditionOrder, currentCondition]);
+
+  useEffect(() => {
+    const onKey = (e) => {
+      if (phase !== 'stimulus') return;
+      const k = e.key.toLowerCase();
+      if (['r','g','b','y'].includes(k)) recordResponse(k);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [phase, recordResponse]);
+
+  useEffect(() => () => clearAllTimers(), []);
+
+  // ---- Cloud submission ----
+  const submitToCloud = useCallback(async () => {
+    if (!APPS_SCRIPT_URL || APPS_SCRIPT_URL.includes('PASTE_YOUR')) {
+      setSubmitStatus('error');
+      return;
+    }
+    setSubmitStatus('sending');
+    const sTimed   = summarize(data, 'timed');
+    const sUntimed = summarize(data, 'untimed');
+    const summaryRows = [];
+    for (const s of [sTimed, sUntimed]) {
+      if (!s) continue;
+      summaryRows.push({
+        submitted_at: new Date().toISOString(),
+        participant_id: participant.id,
+        age: participant.age, gender: participant.gender,
+        condition_order: conditionOrder, notes: '',
+        condition: s.condition,
+        performance_index: +s.performanceIndex.toFixed(2),
+        question_rate_per_min: +s.questionRate.toFixed(2),
+        accuracy_rate_pct: +s.accuracyRate.toFixed(2),
+        avg_response_time_ms: Math.round(s.meanRT),
+        total_questions: s.totalQuestions,
+        wrong_answers: s.wrongAnswers,
+        error_rate_pct: +s.errorRate.toFixed(2),
+        task_completion_rate_pct: +s.taskCompletionRate.toFixed(2),
+        block_duration_ms: BLOCK_DURATION_MS,
+        stroop_effect_ms: Math.round(s.stroopEffect),
+      });
+    }
+    const payload = {
+      session_id: `${participant.id}_${Date.now()}`,
+      trials: data,
+      summary: summaryRows,
+    };
+    try {
+      const res = await fetch(APPS_SCRIPT_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify(payload),
+      });
+      if (res.ok) setSubmitStatus('ok'); else setSubmitStatus('error');
+    } catch (err) {
+      setSubmitStatus('error');
+    }
+  }, [data, participant, conditionOrder]);
+
+  useEffect(() => {
+    if (screen === 'finished' && submitStatus === 'idle') submitToCloud();
+  }, [screen, submitStatus, submitToCloud]);
+
+  // ---------- UI ----------
+  if (screen === 'setup') {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
+        <div className="max-w-xl w-full bg-white rounded-lg shadow-md p-8">
+          <h1 className="text-3xl font-bold text-slate-800 mb-1">Stroop Test</h1>
+          <p className="text-slate-600 mb-6">Effect of Time Pressure on Cognitive Performance</p>
+          <div className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1">Age *</label>
+              <input type="number" value={participant.age}
+                onChange={(e) => setParticipant({ ...participant, age: e.target.value })}
+                placeholder="e.g., 21"
+                className="w-full px-3 py-2 border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500" />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1">Gender *</label>
+              <select value={participant.gender}
+                onChange={(e) => setParticipant({ ...participant, gender: e.target.value })}
+                className="w-full px-3 py-2 border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                <option value="">Select…</option>
+                <option>Female</option><option>Male</option>
+                <option>Other</option><option>Prefer not to say</option>
+              </select>
+            </div>
+          </div>
+          <button disabled={!participant.age.toString().trim() || !participant.gender}
+            onClick={handleStartSession}
+            className="mt-6 w-full bg-blue-600 hover:bg-blue-700 disabled:bg-slate-300 text-white font-medium py-3 rounded-md transition">
+            Continue to Instructions
+          </button>
+          <p className="text-xs text-slate-500 mt-4 text-center">
+            You will complete two 60-second blocks. A unique session ID will be assigned automatically.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (screen === 'instructions') {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
+        <div className="max-w-2xl w-full bg-white rounded-lg shadow-md p-8">
+          <h2 className="text-2xl font-bold text-slate-800 mb-4">Instructions</h2>
+          <div className="space-y-4 text-slate-700">
+            <p>Color words will appear one at a time:&nbsp;
+              <span style={{color:'#dc2626'}} className="font-bold">RED</span>,&nbsp;
+              <span style={{color:'#16a34a'}} className="font-bold">GREEN</span>,&nbsp;
+              <span style={{color:'#2563eb'}} className="font-bold">BLUE</span>, and&nbsp;
+              <span style={{color:'#ca8a04'}} className="font-bold">YELLOW</span>.
+            </p>
+            <p className="font-medium">Respond with the <u>INK COLOR</u> the word is printed in - <u>not</u> what the word says.</p>
+            <div className="bg-slate-100 rounded p-4">
+              <p className="font-medium mb-2">Use these keys:</p>
+              <div className="grid grid-cols-4 gap-3 text-center">
+                <div><kbd className="px-2 py-1 bg-white border border-slate-300 rounded font-bold">R</kbd><div className="text-sm mt-1" style={{color:'#dc2626'}}>Red</div></div>
+                <div><kbd className="px-2 py-1 bg-white border border-slate-300 rounded font-bold">G</kbd><div className="text-sm mt-1" style={{color:'#16a34a'}}>Green</div></div>
+                <div><kbd className="px-2 py-1 bg-white border border-slate-300 rounded font-bold">B</kbd><div className="text-sm mt-1" style={{color:'#2563eb'}}>Blue</div></div>
+                <div><kbd className="px-2 py-1 bg-white border border-slate-300 rounded font-bold">Y</kbd><div className="text-sm mt-1" style={{color:'#ca8a04'}}>Yellow</div></div>
+              </div>
+            </div>
+            <p>Example: <span style={{color:'#2563eb'}} className="font-bold text-xl">RED</span> &rarr; press&nbsp;
+              <kbd className="px-2 py-1 bg-slate-100 border border-slate-300 rounded font-bold">B</kbd> (ink is blue).</p>
+            <p>Short <strong>{PRACTICE_TRIALS}-trial practice</strong> first, then <strong>two 60-second blocks</strong>.
+              Answer as many as you can - accuracy matters too.</p>
+          </div>
+          <button onClick={startPractice}
+            className="mt-6 w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-3 rounded-md transition">
+            Start Practice
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (screen === 'break') {
+    const order = conditionOrder === 'timed_first' ? ['timed','untimed'] : ['untimed','timed'];
+    const upcoming = order[blockIndex];
+    const isPostPractice = data.every(d => d.block === 'practice');
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
+        <div className="max-w-2xl w-full bg-white rounded-lg shadow-md p-8">
+          <h2 className="text-2xl font-bold text-slate-800 mb-4">
+            {isPostPractice ? 'Practice complete' : 'Block complete - take a short break'}
+          </h2>
+          <div className="space-y-4 text-slate-700">
+            <p>Next: the&nbsp;
+              <strong className={upcoming === 'timed' ? 'text-rose-600' : 'text-emerald-600'}>
+                {upcoming === 'timed' ? 'TIMED (timer visible)' : 'UNTIMED (no timer)'}
+              </strong>&nbsp;block - 60 seconds.
+            </p>
+            {upcoming === 'timed' ? (
+              <div className="bg-rose-50 border border-rose-200 rounded p-4">
+                <p className="font-medium text-rose-900">⏱ Timed condition - 60 seconds</p>
+                <p className="text-sm mt-1">
+                  A countdown will be visible on screen. Answer as many words as you can before time runs out.
+                  The test ends automatically at 0:00.
+                </p>
+              </div>
+            ) : (
+              <div className="bg-emerald-50 border border-emerald-200 rounded p-4">
+                <p className="font-medium text-emerald-900">∞ Untimed condition - 60 seconds</p>
+                <p className="text-sm mt-1">
+                  No timer will be shown. Just keep responding to each word - the test will end automatically when the block is over.
+                </p>
+              </div>
+            )}
+            <p className="text-sm text-slate-500">Trials appear continuously - as soon as you press a key, the next word appears.</p>
+          </div>
+          <button onClick={startMainBlock}
+            className="mt-6 w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-3 rounded-md transition">
+            Start {upcoming === 'timed' ? 'Timed' : 'Untimed'} block
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (screen === 'practice' || screen === 'main') {
+    const isMain = screen === 'main';
+    const timeLeftMs = Math.max(0, BLOCK_DURATION_MS - blockElapsedMs);
+    const mm = Math.floor(timeLeftMs / 60000);
+    const ss = Math.floor((timeLeftMs % 60000) / 1000);
+    const timeStr = `${mm}:${ss.toString().padStart(2,'0')}`;
+
+    return (
+      <div className="min-h-screen bg-slate-900 flex flex-col items-center justify-center p-6 select-none relative">
+        {/* Practice label */}
+        {!isMain && (
+          <div className="absolute top-6 left-1/2 -translate-x-1/2 text-slate-400 text-sm">
+            Practice · Trial {practiceIdx + 1} / {PRACTICE_TRIALS}
+          </div>
+        )}
+
+        {/* Timer (timed condition only) */}
+        {isMain && isTimedVisible && (
+          <div className="absolute top-6 left-1/2 -translate-x-1/2 flex flex-col items-center">
+            <div className="text-5xl font-mono font-bold text-rose-400 tabular-nums">{timeStr}</div>
+            <div className="w-64 bg-slate-800 rounded-full h-2 mt-2">
+              <div className="bg-rose-500 h-2 rounded-full transition-all"
+                style={{ width: `${(timeLeftMs / BLOCK_DURATION_MS) * 100}%` }} />
+            </div>
+          </div>
+        )}
+
+        {/* Subtle label only - no time info - for untimed */}
+        {isMain && !isTimedVisible && (
+          <div className="absolute top-6 left-1/2 -translate-x-1/2 text-slate-500 text-xs uppercase tracking-widest">
+            Untimed Block
+          </div>
+        )}
+
+        <div className="h-64 flex items-center justify-center">
+          {phase === 'fixation' && <div className="text-6xl text-slate-500 font-light">+</div>}
+          {phase === 'stimulus' && currentTrial && (
+            <div className="text-7xl font-bold tracking-wide" style={{color: currentTrial.inkHex}}>
+              {currentTrial.word}
+            </div>
+          )}
+          {phase === 'iti' && screen === 'practice' && practiceFeedback && (
+            <div className={`text-3xl font-medium ${practiceFeedback === 'correct' ? 'text-emerald-400' : 'text-rose-400'}`}>
+              {practiceFeedback === 'correct' ? '✓ Correct' : '✗ Incorrect'}
+            </div>
+          )}
+        </div>
+
+        <div className="mt-12 flex gap-3 text-slate-400 text-sm">
+          <span><kbd className="px-2 py-1 bg-slate-800 rounded text-slate-200">R</kbd> Red</span>
+          <span><kbd className="px-2 py-1 bg-slate-800 rounded text-slate-200">G</kbd> Green</span>
+          <span><kbd className="px-2 py-1 bg-slate-800 rounded text-slate-200">B</kbd> Blue</span>
+          <span><kbd className="px-2 py-1 bg-slate-800 rounded text-slate-200">Y</kbd> Yellow</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (screen === 'finished') {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
+        <div className="text-center">
+          <div className="text-7xl mb-6">😊</div>
+          <h2 className="text-3xl font-semibold text-slate-800">Session complete - thank you!</h2>
+        </div>
+      </div>
+    );
+  }
+  return null;
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<StroopApp />);
+</script>
+</body>
+</html>
